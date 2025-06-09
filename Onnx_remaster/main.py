@@ -1,55 +1,134 @@
-import cv2
-import numpy as np
 import onnxruntime as ort
+import numpy as np
+import cv2
+from astra_camera import Camera
+from reid_embedder import ReIDEmbedder
+from deep_sort_realtime.deepsort_tracker import DeepSort
+def compute_iou(boxA, boxB):
+    x1_A, y1_A, x2_A, y2_A = boxA
+    x1_B, y1_B, x2_B, y2_B = boxB
 
-# Load ONNX model
-session = ort.InferenceSession("best_yolov8n_2.onnx", providers=["CPUExecutionProvider"])
+    x1_int = max(x1_A, x1_B)
+    y1_int = max(y1_A, y1_B)
+    x2_int = min(x2_A, x2_B)
+    y2_int = min(y2_A, y2_B)
 
-input_name = session.get_inputs()[0].name
-input_shape = session.get_inputs()[0].shape  # e.g., [1, 3, 640, 640]
-input_height, input_width = input_shape[2], input_shape[3]
+    inter_width = max(0, x2_int - x1_int)
+    inter_height = max(0, y2_int - y1_int)
+    inter_area = inter_width * inter_height
 
-cap = cv2.VideoCapture(0)
+    area_A = (x2_A - x1_A) * (y2_A - y1_A)
+    area_B = (x2_B - x1_B) * (y2_B - y1_B)
+    union_area = area_A + area_B - inter_area
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    iou = inter_area / union_area if union_area > 0 else 0
+    return iou
 
-    # Resize và chuẩn hóa ảnh theo YOLOv8 format
-    img = cv2.resize(frame, (input_width, input_height))
-    img_input = img.astype(np.float32) / 255.0
-    img_input = np.transpose(img_input, (2, 0, 1))  # HWC -> CHW
-    img_input = np.expand_dims(img_input, axis=0)   # Add batch dim
+def first_human(cam,session):
+    while  True:
+            depth,rgb = cam.get_depth_and_color() 
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            if depth is None or depth.size == 0 or rgb is None or rgb.size == 0:
+                continue 
+            img_height, img_width = rgb.shape[:2]
+            rgb = cv2.resize(rgb, (320, 320))
+            depth = cv2.resize(depth,(320,320))
+            img_input = rgb.transpose(2, 0, 1) / 255.0  # HWC → CHW
+            img_input = np.expand_dims(img_input, axis=0).astype(np.float32)
+            
+            output = session.run(None, {input_name: img_input})[0]  # shape: (1, 84, 2100) or (1, 6, N)
+            output = np.squeeze(output).T
 
-    # Run inference
-    outputs = session.run(None, {input_name: img_input})
+            conf_threshold = 0.5
+            angle = 90
+            for pred in output:
+                x, y, w, h, conf = pred
+                if conf < conf_threshold:
+                    continue
+                x1 = int(x-w/2)
+                x2 = int(x+w/2)
+                y1 = int(y-h/2)
+                y2 = int(y+h/2)
+                # Bỏ qua vùng crop không hợp lệ
+                if x1 < 0 or y1 < 0 or x2 > rgb.shape[1] or y2 > rgb.shape[0]:
+                    continue
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                return x1,y1,x2,y2
+            cv2.imshow('rgb',  rgb)   
+            key = cv2.waitKey(1)
+            if key == 27:
+                cv2.destroyAllWindows()
+def get_info(cam,session):
+    try:
+        x1_own, y1_own, x2_own, y2_own  = first_human(cam,session)
+        dem = 0
+        while  True:
+            depth,rgb = cam.get_depth_and_color() 
+            rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            if depth is None or depth.size == 0 or rgb is None or rgb.size == 0:
+                continue 
+            img_height, img_width = rgb.shape[:2]
+            rgb = cv2.resize(rgb, (320, 320))
+            depth = cv2.resize(depth,(320,320))
+            img_input = rgb.transpose(2, 0, 1) / 255.0  # HWC → CHW
+            img_input = np.expand_dims(img_input, axis=0).astype(np.float32)
+            
+            output = session.run(None, {input_name: img_input})[0]  # shape: (1, 84, 2100) or (1, 6, N)
+            output = np.squeeze(output).T
 
-    # Output: shape (1, 5, 2100)
-    output = outputs[0][0]  # (5, 2100)
-    x = output[0]
-    y = output[1]
-    w = output[2]
-    h = output[3]
-    conf = output[4]
-
-    for i in range(conf.shape[0]):
-        score = conf[i]
-        if score > 0.75:
-            cx, cy, bw, bh = x[i], y[i], w[i], h[i]
-            x1 = int(cx - bw / 2)
-            y1 = int(cy - bh / 2)
-            x2 = int(cx + bw / 2)
-            y2 = int(cy + bh / 2)
-
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"{score:.2f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            break
-
-    cv2.imshow("YOLOv8 ONNX Detection", frame)
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+            conf_threshold = 0.3
+            angle = 90
+            max_iou = -1
+            predict_box = (0,0,0,0)
+            for pred in output:
+                x, y, w, h, conf = pred
+                if conf < conf_threshold:
+                    continue
+                x1 = int(x-w/2)
+                x2 = int(x+w/2)
+                y1 = int(y-h/2)
+                y2 = int(y+h/2)
+                # Bỏ qua vùng crop không hợp lệ
+                if x1 < 0 or y1 < 0 or x2 > rgb.shape[1] or y2 > rgb.shape[0]:
+                    continue
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                iou = compute_iou((x1,y1,x2,y2),(x1_own,y1_own,x2_own,y2_own))
+                if iou > max_iou:
+                    max_iou = iou
+                    predict_box = (x1,y1,x2,y2)
+                if iou >= 0.75:
+                    break # Nếu đã ổn thì không sét nữa
+            if predict_box == (0,0,0,0):
+                print(dem)
+                dem+=1 # Check xem co chay khong
+                continue
+            x1_own,y1_own,x2_own,y2_own = predict_box
+            x_mid = x1_own+(x2_own-x1_own)/2
+            angle = (x_mid-160) / 160 * 90 + 90
+            try :
+                dpt = depth[int(y1):int(y2),int(x1):int(x2)]
+                dpt[dpt == 0] = 50000
+                dpt = np.min(dpt)
+            except:
+                dpt = 0
+            cv2.rectangle(rgb, (x1_own, y1_own), (x2_own, y2_own), (0, 255, 0), 2)
+            cv2.imshow('rgb',  rgb)   
+            key = cv2.waitKey(1)
+            if key == 27:
+                cv2.destroyAllWindows()
+                break
+                
+    except Exception as e:
+        print(e)
+cam = Camera()
+try:
+    session = ort.InferenceSession("best_yolov8n_2.onnx", providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    get_info(cam,session)
+except Exception as e:
+    print(e)
+finally:
+    cam.unload()
+    
